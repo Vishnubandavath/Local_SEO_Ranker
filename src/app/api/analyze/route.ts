@@ -10,8 +10,8 @@ import { checkRateLimit, getClientIp } from '@/lib/rate-limit';
  */
 function calculateSeoScore(
   ranking: number,
-  totalResults: number,
-  competitorCount: number,
+  trueSearchVolume: number,
+  organicResultsCount: number,
   hasWebsite: boolean,
   foundInLocalPack: boolean
 ): number {
@@ -32,7 +32,7 @@ function calculateSeoScore(
   }
 
   // Competitor landscape quality (15 pts)
-  score += Math.min(15, competitorCount);
+  score += Math.min(15, organicResultsCount);
 
   // Website presence (10 pts)
   if (hasWebsite) {
@@ -40,8 +40,9 @@ function calculateSeoScore(
   }
 
   // Search volume indicator (10 pts) — more results = more competitive market
-  if (totalResults > 50) score += 10;
-  else if (totalResults > 20) score += 5;
+  if (trueSearchVolume > 1000000) score += 10;
+  else if (trueSearchVolume > 100000) score += 5;
+  else if (trueSearchVolume > 10000) score += 2;
 
   return Math.min(100, Math.max(0, score));
 }
@@ -74,6 +75,7 @@ export async function POST(req: Request) {
     let foundInLocalPack = false;
     let localPackResults: any[] = [];
     let totalOrganicResults = 0;
+    let trueSearchVolume = 0;
     
     if (serpApiKey) {
       try {
@@ -93,6 +95,7 @@ export async function POST(req: Request) {
         // ── Extract organic results ──
         const organicResults = serpResponse.data.organic_results || [];
         totalOrganicResults = organicResults.length;
+        trueSearchVolume = serpResponse.data.search_information?.total_results || totalOrganicResults;
 
         competitors = organicResults.slice(0, 10).map((r: any) => ({
           title: r.title,
@@ -104,9 +107,10 @@ export async function POST(req: Request) {
         // ── Find user's business in organic results ──
         if (businessName || website) {
           const found = organicResults.find((r: any) => {
-            const matchWebsite = website && r.link?.toLowerCase().includes(website.toLowerCase());
-            const matchName = businessName && r.title?.toLowerCase().includes(businessName.toLowerCase());
-            return matchWebsite || matchName;
+            if (website && r.link?.toLowerCase().includes(website.toLowerCase())) return true;
+            // Only fallback to title match if website was not provided, to prevent false positives
+            if (!website && businessName && r.title?.toLowerCase().includes(businessName.toLowerCase())) return true;
+            return false;
           });
           if (found) {
             ranking = found.position; // Real Google position!
@@ -132,10 +136,6 @@ export async function POST(req: Request) {
             });
             if (foundLocal) {
               foundInLocalPack = true;
-              if (ranking === 0) {
-                // They're in Map Pack but not organic — still has a position
-                ranking = localResults.indexOf(foundLocal) + 1;
-              }
             }
           }
         }
@@ -154,6 +154,7 @@ export async function POST(req: Request) {
       ];
       ranking = Math.floor(Math.random() * 30) + 5;
       totalOrganicResults = 85;
+      trueSearchVolume = 150000;
       localPackResults = [
         { title: "Joe's Plumbing", rating: 4.8, reviews: 523, position: 1 },
         { title: "Austin Pro Plumbers", rating: 4.6, reviews: 312, position: 2 },
@@ -163,8 +164,8 @@ export async function POST(req: Request) {
     // ── Calculate SEO score from real SERP data ──
     const seoScore = calculateSeoScore(
       ranking,
+      trueSearchVolume,
       totalOrganicResults,
-      competitors.length,
       !!website,
       foundInLocalPack
     );
@@ -227,7 +228,13 @@ Generate exactly 5 keyword ideas relevant to "${keyword}" in "${location}".`
         );
         
         const content = aiResponse.data.choices[0].message.content;
-        const parsed = JSON.parse(content || '{}');
+        const cleanedContent = content?.replace(/```json/gi, '').replace(/```/g, '').trim() || '{}';
+        let parsed: any = {};
+        try {
+          parsed = JSON.parse(cleanedContent);
+        } catch (e) {
+          console.error("JSON parse error:", e);
+        }
         keywords = parsed.keywords || [];
         insights = parsed.insights || "Analysis complete. Focus on local citations and Google Business Profile optimization.";
       } catch (err: any) {
