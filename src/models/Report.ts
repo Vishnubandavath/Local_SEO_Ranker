@@ -5,6 +5,9 @@ export interface ICompetitor {
   link: string;
   snippet?: string;
   position: number;
+  isDirectory?: boolean;
+  competitorScore?: number;
+  rankReasons?: string[];
 }
 
 export interface IKeywordIdea {
@@ -24,6 +27,14 @@ export interface IReport extends Document {
   seoScore: number;
   insights: string;
   createdAt: Date;
+  isConvertedToLead?: boolean;
+  features?: {
+    rankBucket: string;
+    inMapPack: boolean;
+    competitorDensity: number;
+    directoryDensity: number;
+    localIntentSignal: number;
+  };
 }
 
 const CompetitorSchema = new Schema({
@@ -31,6 +42,9 @@ const CompetitorSchema = new Schema({
   link: String,
   snippet: String,
   position: Number,
+  isDirectory: { type: Boolean, default: false },
+  competitorScore: { type: Number, default: 0 },
+  rankReasons: [{ type: String }],
 });
 
 const KeywordIdeaSchema = new Schema({
@@ -50,6 +64,14 @@ const ReportSchema: Schema = new Schema({
   seoScore: { type: Number, default: 0 },
   insights: { type: String, default: "" },
   createdAt: { type: Date, default: Date.now },
+  isConvertedToLead: { type: Boolean, default: false },
+  features: {
+    rankBucket: { type: String, enum: ['top3', 'top10', 'page2', 'buried', 'none'] },
+    inMapPack: { type: Boolean },
+    competitorDensity: { type: Number },
+    directoryDensity: { type: Number },
+    localIntentSignal: { type: Number },
+  }
 });
 
 export default mongoose.models.Report || mongoose.model<IReport>('Report', ReportSchema);

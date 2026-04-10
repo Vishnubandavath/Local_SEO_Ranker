@@ -3,60 +3,74 @@ import dbConnect from '@/lib/mongodb';
 import Report from '@/models/Report';
 import axios from 'axios';
 import { checkRateLimit, getClientIp } from '@/lib/rate-limit';
+import {
+  calculateSeoScore,
+  findBusinessInResults,
+  findBusinessInLocalPack,
+  extractCompetitors,
+  countDirectoriesInTopN,
+  extractFeatures,
+} from '@/lib/seo-utils';
+import {
+  serpCache,
+  llmCache,
+  makeCacheKey,
+  makeCanonicalSerpKey,
+  makeLlmCacheKey,
+  findCachedReport,
+  CachedSerpData,
+  getCacheMetrics,
+} from '@/lib/cache';
+import {
+  extractKeywordIdeas,
+  generateFallbackInsights,
+  buildCompressedLlmPrompt,
+} from '@/lib/keyword-extractor';
 
-/**
- * Calculates SEO score from real Google SERP data.
- * Now accurate because SerpAPI provides actual Google ranking positions.
- */
-function calculateSeoScore(
-  ranking: number,
-  trueSearchVolume: number,
-  organicResultsCount: number,
-  hasWebsite: boolean,
-  foundInLocalPack: boolean
-): number {
-  let score = 0;
-
-  // Ranking position (40 pts max)
-  if (ranking > 0 && ranking <= 100) {
-    if (ranking <= 3) score += 40;           // Top 3 = full points
-    else if (ranking <= 10) score += 35 - (ranking - 3);  // Page 1
-    else if (ranking <= 20) score += 22 - Math.floor((ranking - 10) / 2); // Page 2
-    else if (ranking <= 50) score += 12;     // Pages 3-5
-    else score += 5;                          // Found but buried
+// ── Observability Wrapper ──
+function timeIt<T>(label: string, fn: () => T | Promise<T>): { result: T; durationMs: number } | Promise<{ result: T; durationMs: number }> {
+  const start = performance.now();
+  const res = fn();
+  if (res instanceof Promise) {
+    return res.then(r => ({ result: r, durationMs: Math.round(performance.now() - start) }));
   }
+  return { result: res, durationMs: Math.round(performance.now() - start) };
+}
 
-  // Local Map Pack presence (25 pts) — huge for local SEO
-  if (foundInLocalPack) {
-    score += 25;
+// ── SERP Fetch Helper ──
+async function fetchSerp(query: string, location: string, apiKey: string): Promise<CachedSerpData> {
+  const canonicalKey = makeCanonicalSerpKey(query, location);
+  const cached = serpCache.get(canonicalKey, true);
+  if (cached) return cached;
+
+  try {
+    const res = await axios.get('https://serpapi.com/search', {
+      params: { engine: 'google', q: query, location, api_key: apiKey, num: 100, gl: 'us', hl: 'en' },
+    });
+    const data: CachedSerpData = {
+      organicResults: res.data.organic_results || [],
+      localResults: res.data.local_results?.places || [],
+      totalOrganicResults: res.data.organic_results?.length || 0,
+      trueSearchVolume: res.data.search_information?.total_results || 0,
+      timestamp: Date.now(),
+    };
+    // Save to shared canonical pool (3h TTL)
+    serpCache.set(canonicalKey, data, 3 * 60 * 60);
+    return data;
+  } catch (err) {
+    return { organicResults: [], localResults: [], totalOrganicResults: 0, trueSearchVolume: 0, timestamp: Date.now() };
   }
-
-  // Competitor landscape quality (15 pts)
-  score += Math.min(15, organicResultsCount);
-
-  // Website presence (10 pts)
-  if (hasWebsite) {
-    score += 10;
-  }
-
-  // Search volume indicator (10 pts) — more results = more competitive market
-  if (trueSearchVolume > 1000000) score += 10;
-  else if (trueSearchVolume > 100000) score += 5;
-  else if (trueSearchVolume > 10000) score += 2;
-
-  return Math.min(100, Math.max(0, score));
 }
 
 export async function POST(req: Request) {
+  const t0 = performance.now();
+  const logs: Record<string, any> = { event: 'AnalysisRequest' };
+
   try {
-    // Rate limit: 5 analyses per minute per IP
     const ip = getClientIp(req);
     const limit = checkRateLimit(ip, { maxRequests: 5, windowSeconds: 60 });
     if (!limit.allowed) {
-      return NextResponse.json(
-        { error: `Too many requests. Please try again in ${limit.resetInSeconds} seconds.` },
-        { status: 429, headers: { 'Retry-After': String(limit.resetInSeconds) } }
-      );
+      return NextResponse.json({ error: `Try again in ${limit.resetInSeconds}s.` }, { status: 429 });
     }
 
     await dbConnect();
@@ -64,221 +78,154 @@ export async function POST(req: Request) {
     const { keyword, location, businessName, website } = body;
 
     if (!keyword || !location) {
-      return NextResponse.json({ error: 'Keyword and location are required' }, { status: 400 });
+      return NextResponse.json({ error: 'Keyword and location required' }, { status: 400 });
+    }
+
+    logs.keyword = keyword;
+    logs.location = location;
+
+    // L2 Cache
+    const cachedReport = await findCachedReport(Report, keyword, location, 3 * 3600 * 1000);
+    if (cachedReport) {
+      logs.cacheHit = 'L2_MONGO';
+      logs.durationMs = Math.round(performance.now() - t0);
+      console.log(JSON.stringify(logs));
+      return NextResponse.json({ reportId: cachedReport._id, ranking: cachedReport.ranking, seoScore: cachedReport.seoScore, message: "Partial data returned." });
     }
 
     const serpApiKey = process.env.SERPAPI_KEY;
     const groqApiKey = process.env.GROQ_API_KEY;
 
-    let competitors: any[] = [];
+    let serpQueriesCount = 0;
+    let organicResults: any[] = [];
+    let localResults: any[] = [];
     let ranking = 0;
     let foundInLocalPack = false;
-    let localPackResults: any[] = [];
-    let totalOrganicResults = 0;
-    let trueSearchVolume = 0;
-    
+
+    // ── PROGRESSIVE MULTI-QUERY EXTRACTION ──
     if (serpApiKey) {
-      try {
-        // ── Fetch real Google SERP data via SerpAPI ──
-        const serpResponse = await axios.get('https://serpapi.com/search', {
-          params: {
-            engine: 'google',
-            q: `${keyword} in ${location}`,
-            location: location,
-            api_key: serpApiKey,
-            num: 100,
-            gl: 'us',
-            hl: 'en'
-          }
-        });
+      // Query 1: Base Query
+      const { result: baseData, durationMs: ms1 } = await timeIt('Serp1', () => fetchSerp(`${keyword} in ${location}`, location, serpApiKey));
+      serpQueriesCount++;
+      organicResults = baseData.organicResults;
+      localResults = baseData.localResults;
+      logs.serpMs = ms1;
 
-        // ── Extract organic results ──
-        const organicResults = serpResponse.data.organic_results || [];
-        totalOrganicResults = organicResults.length;
-        trueSearchVolume = serpResponse.data.search_information?.total_results || totalOrganicResults;
-
-        competitors = organicResults.slice(0, 10).map((r: any) => ({
-          title: r.title,
-          link: r.link,
-          snippet: r.snippet || '',
-          position: r.position
-        }));
-
-        // ── Find user's business in organic results ──
-        if (businessName || website) {
-          const found = organicResults.find((r: any) => {
-            if (website && r.link?.toLowerCase().includes(website.toLowerCase())) return true;
-            // Only fallback to title match if website was not provided, to prevent false positives
-            if (!website && businessName && r.title?.toLowerCase().includes(businessName.toLowerCase())) return true;
-            return false;
-          });
-          if (found) {
-            ranking = found.position; // Real Google position!
-          }
-        }
-
-        // ── Check Google Local Map Pack ──
-        const localResults = serpResponse.data.local_results?.places || [];
-        if (localResults.length > 0) {
-          localPackResults = localResults.slice(0, 5).map((r: any, idx: number) => ({
-            title: r.title,
-            rating: r.rating,
-            reviews: r.reviews,
-            position: idx + 1
-          }));
-
-          // Check if user is in the local pack
-          if (businessName || website) {
-            const foundLocal = localResults.find((r: any) => {
-              const matchName = businessName && r.title?.toLowerCase().includes(businessName.toLowerCase());
-              const matchWebsite = website && r.website?.toLowerCase().includes(website.toLowerCase());
-              return matchName || matchWebsite;
-            });
-            if (foundLocal) {
-              foundInLocalPack = true;
-            }
-          }
-        }
-
-      } catch (err: any) {
-        console.error("SerpAPI Error:", err.response?.data || err.message);
+      if (businessName || website) {
+        const match = findBusinessInResults(organicResults, businessName, website);
+        if (match.found) ranking = match.position;
+        foundInLocalPack = findBusinessInLocalPack(localResults, businessName, website);
       }
-    } else {
-      // Mock data for development without API key
-      competitors = [
-        { title: "Joe's Plumbing - #1 in Austin", link: "https://joesplumbing.com", snippet: "Top-rated local plumber with 500+ 5-star reviews.", position: 1 },
-        { title: "Austin Pro Plumbers", link: "https://austinproplumbers.com", snippet: "24/7 emergency plumbing. Licensed & insured.", position: 2 },
-        { title: "Capital City Plumbing Co.", link: "https://capitalcityplumbing.com", snippet: "Serving Austin since 1998. Free estimates.", position: 3 },
-        { title: "Lone Star Drain Solutions", link: "https://lonestardrain.com", snippet: "Drain cleaning, water heater repair, pipe replacement.", position: 4 },
-        { title: "RotoRooter Austin", link: "https://rotorooter.com/austin", snippet: "Nationwide plumbing with local Austin teams.", position: 5 },
-      ];
-      ranking = Math.floor(Math.random() * 30) + 5;
-      totalOrganicResults = 85;
-      trueSearchVolume = 150000;
-      localPackResults = [
-        { title: "Joe's Plumbing", rating: 4.8, reviews: 523, position: 1 },
-        { title: "Austin Pro Plumbers", rating: 4.6, reviews: 312, position: 2 },
-      ];
-    }
 
-    // ── Calculate SEO score from real SERP data ──
-    const seoScore = calculateSeoScore(
-      ranking,
-      trueSearchVolume,
-      totalOrganicResults,
-      !!website,
-      foundInLocalPack
-    );
-
-    // ── Generate AI keywords AND insights using Groq ──
-    let keywords: any[] = [];
-    let insights = "";
-
-    if (groqApiKey) {
-      try {
-        const competitorSummary = competitors.slice(0, 5)
-          .map(c => `#${c.position}: ${c.title} — ${c.snippet}`)
-          .join('\n');
-
-        const localPackSummary = localPackResults.length > 0
-          ? localPackResults.map((r: any) => `${r.title} (${r.rating}★, ${r.reviews} reviews)`).join(', ')
-          : 'No local pack results';
+      // Check Confidence (If we didn't rank high, let's expand to see if variations are better)
+      const isWeakRanking = ranking === 0 || ranking > 10;
+      
+      if (isWeakRanking) {
+        // Query 2 & 3: Expansions
+        const q2 = `best ${keyword} in ${location}`;
+        const q3 = `${keyword} near me`;
         
-        const aiResponse = await axios.post(
-          'https://api.groq.com/openai/v1/chat/completions',
-          {
-            model: "llama-3.3-70b-versatile",
-            messages: [
-              { 
-                role: "system", 
-                content: "You are a local SEO expert. Provide specific, actionable advice based on real Google search data. Output ONLY valid JSON." 
-              },
-              { 
-                role: "user", 
-                content: `Analyze this REAL Google search data and return a JSON response:
-
-BUSINESS: "${businessName || 'Not provided'}"
-KEYWORD: "${keyword}"
-LOCATION: "${location}"
-WEBSITE: ${website || 'Not provided'}
-GOOGLE RANKING: ${ranking > 0 ? `#${ranking} out of ${totalOrganicResults} organic results` : `Not found in top ${totalOrganicResults} results`}
-IN GOOGLE MAP PACK: ${foundInLocalPack ? 'Yes' : 'No'}
-SEO SCORE: ${seoScore}/100
-
-TOP 5 ORGANIC COMPETITORS:
-${competitorSummary}
-
-GOOGLE MAP PACK:
-${localPackSummary}
-
-Return EXACTLY this JSON:
-{
-  "keywords": [
-    { "keyword": "specific localized keyword", "searchVolume": "High/Medium/Low", "difficulty": "Easy/Medium/Hard" }
-  ],
-  "insights": "Write 3-4 sentences. Reference specific competitors by name. Mention the actual ranking position. Give concrete next steps (e.g. 'You need X more reviews to match Y competitor'). Be direct."
-}
-
-Generate exactly 5 keyword ideas relevant to "${keyword}" in "${location}".`
-              }
-            ],
-            response_format: { type: "json_object" }
-          },
-          { headers: { Authorization: `Bearer ${groqApiKey}`, "Content-Type": "application/json" } }
+        const { result: extVars, durationMs: msExt } = await timeIt('SerpExt', () => 
+          Promise.all([fetchSerp(q2, location, serpApiKey), fetchSerp(q3, location, serpApiKey)])
         );
-        
-        const content = aiResponse.data.choices[0].message.content;
-        const cleanedContent = content?.replace(/```json/gi, '').replace(/```/g, '').trim() || '{}';
-        let parsed: any = {};
-        try {
-          parsed = JSON.parse(cleanedContent);
-        } catch (e) {
-          console.error("JSON parse error:", e);
+        serpQueriesCount += 2;
+        logs.serpExpandMs = msExt;
+
+        // Aggregate: Keep the BEST ranking observed across all queries
+        for (const data of extVars) {
+          const match = findBusinessInResults(data.organicResults, businessName, website);
+          if (match.found && (ranking === 0 || match.position < ranking)) {
+            ranking = match.position; // Take the better rank
+          }
+          if (!foundInLocalPack && findBusinessInLocalPack(data.localResults, businessName, website)) {
+            foundInLocalPack = true;
+          }
         }
-        keywords = parsed.keywords || [];
-        insights = parsed.insights || "Analysis complete. Focus on local citations and Google Business Profile optimization.";
-      } catch (err: any) {
-        console.error("Groq Error:", err.response?.data || err.message);
-        // Fallback insights
-        insights = ranking > 0
-          ? `Your business ranks #${ranking} on Google for "${keyword}" in ${location}. ${ranking <= 10 ? 'You\'re on page 1 — focus on climbing into the top 3 where 75% of clicks happen.' : `You're on page ${Math.ceil(ranking / 10)}. Build more local backlinks and Google reviews to reach page 1.`} ${foundInLocalPack ? 'Great news: you appear in the Google Map Pack!' : 'You\'re not in the Google Map Pack — claim and optimize your Google Business Profile.'}`
-          : `Your business was not found in the top ${totalOrganicResults} Google results for "${keyword}" in ${location}. Start by claiming your Google Business Profile, building citations on Yelp and industry directories, and creating "${keyword} in ${location}" content on your website.`;
       }
     } else {
-      // Mock data
-      keywords = [
-        { keyword: `${keyword} near me`, searchVolume: "High", difficulty: "Hard" },
-        { keyword: `best ${keyword} in ${location}`, searchVolume: "Medium", difficulty: "Medium" },
-        { keyword: `affordable ${keyword} ${location}`, searchVolume: "Medium", difficulty: "Easy" },
-        { keyword: `emergency ${keyword} ${location}`, searchVolume: "High", difficulty: "Medium" },
-        { keyword: `top rated ${keyword} near ${location}`, searchVolume: "Low", difficulty: "Easy" },
-      ];
-      insights = `Your business ranks approximately #${ranking} on Google for "${keyword}" in ${location}. ${ranking <= 10 ? 'You\'re on page 1 — optimize for the Map Pack and aim for the top 3.' : `Move toward page 1 by building local backlinks and earning more Google reviews.`} The top competitor, "${competitors[0]?.title}", holds position #1 — study their content strategy and review profile.`;
+      // Mock fallback
+      ranking = 15;
+      organicResults = [{ title: "Mock", link: "mock.com", snippet: "Mock", position: 1 }];
     }
 
-    const report = new Report({
-      keyword,
-      location,
-      businessName,
-      website,
+    // ── FEATURE ENGINEERING ──
+    const searchFeatures = extractFeatures(ranking, foundInLocalPack, organicResults, keyword);
+
+    // ── SCORING ──
+    const seoScore = calculateSeoScore({
       ranking,
-      competitors,
-      keywords,
-      seoScore,
-      insights
+      foundInLocalPack,
+      organicResultsCount: organicResults.length,
+      totalSearchResults: 1000,
+      directoryCountInTop10: countDirectoriesInTopN(organicResults, 10),
     });
 
+    const competitors = extractCompetitors(organicResults, keyword);
+    const keywords = extractKeywordIdeas(competitors, keyword, location, 5);
+
+    // ── LLM INSIGHTS ──
+    let insights = "";
+    if (groqApiKey) {
+      const llmKey = makeLlmCacheKey(keyword, location, ranking, seoScore);
+      const cachedLlm = llmCache.get(llmKey);
+      if (cachedLlm) {
+        insights = cachedLlm.insights;
+        logs.llmHit = true;
+      } else {
+        logs.llmHit = false;
+        try {
+          const prompt = buildCompressedLlmPrompt({
+            businessName: businessName || '', keyword, location, ranking, seoScore, foundInLocalPack, 
+            totalOrganicResults: organicResults.length,
+            topCompetitors: competitors.slice(0, 5).map(c => ({ name: c.title, position: c.position })),
+            localPackTop: localResults.slice(0, 3).map((r: any) => ({ name: r.title, rating: r.rating || 0, reviews: r.reviews || 0 })),
+          });
+          
+          const { result: llmRes, durationMs: llmMs } = await timeIt('LLM', async () => {
+            return axios.post('https://api.groq.com/openai/v1/chat/completions', {
+              model: "llama-3.3-70b-versatile",
+              messages: [{ role: "system", content: "You are an SEO expert. Output JSON." }, { role: "user", content: prompt }],
+              response_format: { type: "json_object" },
+              max_tokens: 300,
+            }, { headers: { Authorization: `Bearer ${groqApiKey}`, "Content-Type": "application/json" } });
+          });
+          logs.llmMs = llmMs;
+
+          const content = llmRes.data.choices[0].message.content;
+          const parsed = JSON.parse(content?.replace(/```json/gi, '').replace(/```/g, '').trim() || '{}');
+          insights = parsed.insights || "";
+          if (insights) llmCache.set(llmKey, { insights }, 6 * 3600); // 6h adaptive TTL hook
+        } catch (e: any) { logs.llmError = e.message; }
+      }
+    }
+
+    if (!insights) {
+      insights = generateFallbackInsights({
+        keyword, location, ranking, seoScore, foundInLocalPack, totalOrganicResults: organicResults.length,
+        topCompetitorName: competitors[0]?.title || '', topCompetitorPosition: competitors[0]?.position || 0,
+      });
+      logs.insightsFallback = true;
+    }
+
+    // ── DATABASE PERSISTENCE ──
+    const report = new Report({
+      keyword, location, businessName, website,
+      ranking, competitors, keywords, seoScore, insights,
+      features: searchFeatures // Backward compatible addition
+    });
     await report.save();
 
-    return NextResponse.json({
-      reportId: report._id,
-      ranking: report.ranking,
-      seoScore: report.seoScore,
-      message: "Partial data returned. Submit lead form to unlock full report."
-    });
+    // Finalize Observability
+    logs.cacheMetrics = getCacheMetrics();
+    logs.serpQueriesUsed = serpQueriesCount;
+    logs.durationMs = Math.round(performance.now() - t0);
+    console.log(JSON.stringify(logs));
+
+    return NextResponse.json({ reportId: report._id, ranking: report.ranking, seoScore: report.seoScore, message: "Partial data returned." });
 
   } catch (error: any) {
-    console.error(error);
-    return NextResponse.json({ error: error.message || 'Internal server error' }, { status: 500 });
+    logs.error = error.message;
+    console.error(JSON.stringify(logs));
+    return NextResponse.json({ error: error.message || 'Error' }, { status: 500 });
   }
 }

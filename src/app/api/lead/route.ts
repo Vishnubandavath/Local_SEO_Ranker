@@ -25,7 +25,11 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'Missing required fields' }, { status: 400 });
     }
 
-    const report = await Report.findById(reportId);
+    const report = await Report.findByIdAndUpdate(
+      reportId,
+      { isConvertedToLead: true },
+      { new: true }
+    );
     if (!report) {
       return NextResponse.json({ error: 'Report not found' }, { status: 404 });
     }
