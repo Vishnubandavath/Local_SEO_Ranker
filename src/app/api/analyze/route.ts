@@ -10,7 +10,11 @@ import {
   extractCompetitors,
   countDirectoriesInTopN,
   extractFeatures,
+  calculateCustomerLoss,
+  enrichCompetitorsWithDominance
 } from '@/lib/seo-utils';
+import { performSeoAudit } from '@/lib/audit-utils';
+import { extractReviewMetrics } from '@/lib/review-utils';
 import {
   serpCache,
   llmCache,
@@ -85,7 +89,7 @@ export async function POST(req: Request) {
     logs.location = location;
 
     // L2 Cache
-    const cachedReport = await findCachedReport(Report, keyword, location, 3 * 3600 * 1000);
+    const cachedReport = await findCachedReport(Report, keyword, location, businessName, website, 3 * 3600 * 1000);
     if (cachedReport) {
       logs.cacheHit = 'L2_MONGO';
       logs.durationMs = Math.round(performance.now() - t0);
@@ -96,9 +100,13 @@ export async function POST(req: Request) {
     const serpApiKey = process.env.SERPAPI_KEY;
     const groqApiKey = process.env.GROQ_API_KEY;
 
+    // FEATURE 3: Start Audit concurrently with SERP
+    const auditPromise = performSeoAudit(website, keyword);
+
     let serpQueriesCount = 0;
     let organicResults: any[] = [];
     let localResults: any[] = [];
+    let allQueriesOrganicResults: any[][] = [];
     let ranking = 0;
     let foundInLocalPack = false;
 
@@ -109,6 +117,7 @@ export async function POST(req: Request) {
       serpQueriesCount++;
       organicResults = baseData.organicResults;
       localResults = baseData.localResults;
+      allQueriesOrganicResults.push(baseData.organicResults);
       logs.serpMs = ms1;
 
       if (businessName || website) {
@@ -117,7 +126,7 @@ export async function POST(req: Request) {
         foundInLocalPack = findBusinessInLocalPack(localResults, businessName, website);
       }
 
-      // Check Confidence (If we didn't rank high, let's expand to see if variations are better)
+      // Check Confidence
       const isWeakRanking = ranking === 0 || ranking > 10;
       
       if (isWeakRanking) {
@@ -131,11 +140,12 @@ export async function POST(req: Request) {
         serpQueriesCount += 2;
         logs.serpExpandMs = msExt;
 
-        // Aggregate: Keep the BEST ranking observed across all queries
+        // Aggregate
         for (const data of extVars) {
+          allQueriesOrganicResults.push(data.organicResults);
           const match = findBusinessInResults(data.organicResults, businessName, website);
           if (match.found && (ranking === 0 || match.position < ranking)) {
-            ranking = match.position; // Take the better rank
+            ranking = match.position;
           }
           if (!foundInLocalPack && findBusinessInLocalPack(data.localResults, businessName, website)) {
             foundInLocalPack = true;
@@ -143,9 +153,9 @@ export async function POST(req: Request) {
         }
       }
     } else {
-      // Mock fallback
       ranking = 15;
       organicResults = [{ title: "Mock", link: "mock.com", snippet: "Mock", position: 1 }];
+      allQueriesOrganicResults.push(organicResults);
     }
 
     // ── FEATURE ENGINEERING ──
@@ -160,7 +170,16 @@ export async function POST(req: Request) {
       directoryCountInTop10: countDirectoriesInTopN(organicResults, 10),
     });
 
-    const competitors = extractCompetitors(organicResults, keyword);
+    let competitors = extractCompetitors(organicResults, keyword);
+    
+    // FEATURE 1 & 5: Dominance Score and Market Share
+    const domRes = enrichCompetitorsWithDominance(competitors, allQueriesOrganicResults, localResults);
+    competitors = domRes.enriched;
+    const dominanceData = domRes.dominance;
+
+    // FEATURE 2: Review Metric Extraction
+    const reviewMetrics = extractReviewMetrics(localResults, businessName, website);
+
     const keywords = extractKeywordIdeas(competitors, keyword, location, 5);
 
     // ── LLM INSIGHTS ──
@@ -207,11 +226,19 @@ export async function POST(req: Request) {
       logs.insightsFallback = true;
     }
 
+    // FEATURE 3 & 4 resolution
+    const seoAudit = await auditPromise;
+    const lossEstimateData = calculateCustomerLoss(ranking);
+
     // ── DATABASE PERSISTENCE ──
     const report = new Report({
       keyword, location, businessName, website,
       ranking, competitors, keywords, seoScore, insights,
-      features: searchFeatures // Backward compatible addition
+      features: searchFeatures,
+      reviewMetrics,
+      seoAudit,
+      dominanceData,
+      lossEstimate: lossEstimateData.lossPercent
     });
     await report.save();
 

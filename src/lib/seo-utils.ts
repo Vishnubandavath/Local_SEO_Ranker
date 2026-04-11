@@ -316,6 +316,9 @@ export interface CompetitorResult {
   isDirectory: boolean;
   competitorScore: number;
   rankReasons: string[];
+  dominanceScore?: number;
+  marketShare?: number;
+  frequency?: number;
 }
 
 // ── Competitor Scoring Weights ──
@@ -634,4 +637,85 @@ export function extractFeatures(
     directoryDensity,
     localIntentSignal: hasLocalIntent,
   };
+}
+
+export function calculateCustomerLoss(rank: number) {
+  const ctrMap = [0.28, 0.15, 0.10, 0.07, 0.05, 0.04, 0.03, 0.02, 0.01, 0.01];
+  const potentialTraffic = 0.28;
+  const actualTraffic = (rank > 0 && rank <= 10) ? ctrMap[rank - 1] : 0;
+  
+  const loss = potentialTraffic - actualTraffic;
+  const lossPercent = Math.round((loss / potentialTraffic) * 100);
+  
+  return {
+    potentialTraffic,
+    actualTraffic,
+    lossPercent: Math.max(0, lossPercent)
+  };
+}
+
+export interface DominanceData {
+  topDominantName: string;
+  message: string;
+}
+
+export function enrichCompetitorsWithDominance(
+  competitors: CompetitorResult[],
+  allOrganicResults: any[][],
+  localResults: any[]
+): { enriched: CompetitorResult[], dominance: DominanceData } {
+  let totalDominance = 0;
+
+  const enriched = competitors.map(comp => {
+    const rankingScore = comp.position > 0 ? (1 / comp.position) * 100 : 0;
+    
+    let reviewStrength = 0;
+    const compDomain = comp.link ? normalizeDomain(comp.link) : '';
+    const compLocal = localResults.find((r: any) => 
+      (r.website && normalizeDomain(r.website) === compDomain) ||
+      (r.title && r.title.toLowerCase().includes(comp.title.toLowerCase()))
+    );
+    if (compLocal) {
+      reviewStrength = (compLocal.rating || 0) * Math.log(1 + (compLocal.reviews || 0));
+    }
+
+    const keywordMatch = comp.competitorScore;
+
+    let frequency = 0;
+    for (const resList of allOrganicResults) {
+      const found = resList.some((r: any) => {
+        const d = r.link ? normalizeDomain(r.link) : '';
+        return d && d === compDomain;
+      });
+      if (found) frequency++;
+    }
+    const presenceAcrossQueries = allOrganicResults.length > 0 ? (frequency / allOrganicResults.length) * 100 : 100;
+
+    const dominanceScore = Math.round(
+      0.3 * rankingScore + 
+      0.3 * reviewStrength + 
+      0.2 * keywordMatch + 
+      0.2 * presenceAcrossQueries
+    );
+
+    totalDominance += dominanceScore;
+
+    return { ...comp, dominanceScore, frequency };
+  });
+
+  const finalEnriched = enriched.map(c => {
+    return {
+      ...c,
+      marketShare: totalDominance > 0 ? Math.round((c.dominanceScore! / totalDominance) * 100) : 0
+    };
+  }).sort((a,b) => b.dominanceScore! - a.dominanceScore!);
+
+  let dominance = { topDominantName: '', message: '' };
+  if (finalEnriched.length > 0) {
+    const top = finalEnriched[0];
+    dominance.topDominantName = top.title;
+    dominance.message = `${top.title} dominates this market. Appears in ${top.frequency}/${allOrganicResults.length || 1} queries with highest dominance.`;
+  }
+
+  return { enriched: finalEnriched, dominance };
 }

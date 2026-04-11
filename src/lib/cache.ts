@@ -155,15 +155,37 @@ export async function findCachedReport(
   ReportModel: any,
   keyword: string,
   location: string,
+  businessName?: string,
+  website?: string,
   maxAgeMs: number = 3 * 60 * 60 * 1000
 ): Promise<any | null> {
   try {
     const cutoff = new Date(Date.now() - maxAgeMs);
-    const report = await ReportModel.findOne({
+    const query: any = {
       keyword: { $regex: new RegExp(`^${escapeRegex(keyword.trim())}$`, 'i') },
       location: { $regex: new RegExp(`^${escapeRegex(location.trim())}$`, 'i') },
       createdAt: { $gte: cutoff },
-    })
+    };
+
+    const conditions = [];
+
+    if (businessName) {
+      conditions.push({ businessName: { $regex: new RegExp(`^${escapeRegex(businessName.trim())}$`, 'i') } });
+    } else {
+      conditions.push({ $or: [{ businessName: { $exists: false } }, { businessName: "" }, { businessName: null }] });
+    }
+
+    if (website) {
+      conditions.push({ website: { $regex: new RegExp(`^${escapeRegex(website.trim())}$`, 'i') } });
+    } else {
+      conditions.push({ $or: [{ website: { $exists: false } }, { website: "" }, { website: null }] });
+    }
+
+    if (conditions.length > 0) {
+      query.$and = conditions;
+    }
+
+    const report = await ReportModel.findOne(query)
       .sort({ createdAt: -1 })
       .lean();
 

@@ -8,6 +8,8 @@ export interface ICompetitor {
   isDirectory?: boolean;
   competitorScore?: number;
   rankReasons?: string[];
+  dominanceScore?: number;
+  marketShare?: number;
 }
 
 export interface IKeywordIdea {
@@ -35,6 +37,10 @@ export interface IReport extends Document {
     directoryDensity: number;
     localIntentSignal: number;
   };
+  reviewMetrics?: any;
+  seoAudit?: any;
+  dominanceData?: any;
+  lossEstimate?: number;
 }
 
 const CompetitorSchema = new Schema({
@@ -45,6 +51,8 @@ const CompetitorSchema = new Schema({
   isDirectory: { type: Boolean, default: false },
   competitorScore: { type: Number, default: 0 },
   rankReasons: [{ type: String }],
+  dominanceScore: { type: Number, default: 0 },
+  marketShare: { type: Number, default: 0 }
 });
 
 const KeywordIdeaSchema = new Schema({
@@ -71,7 +79,16 @@ const ReportSchema: Schema = new Schema({
     competitorDensity: { type: Number },
     directoryDensity: { type: Number },
     localIntentSignal: { type: Number },
-  }
+  },
+  reviewMetrics: { type: Schema.Types.Mixed },
+  seoAudit: { type: Schema.Types.Mixed },
+  dominanceData: { type: Schema.Types.Mixed },
+  lossEstimate: { type: Number }
 });
 
-export default mongoose.models.Report || mongoose.model<IReport>('Report', ReportSchema);
+// Clear Mongoose model cache in Next.js Hot Module Reloads
+if (mongoose.models.Report) {
+  delete mongoose.models.Report;
+}
+
+export default mongoose.model<IReport>('Report', ReportSchema);

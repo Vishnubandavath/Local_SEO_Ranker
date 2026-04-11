@@ -60,9 +60,9 @@ export function LeadGateModal({ reportId, onUnlock }: { reportId: string, onUnlo
             <div className="w-16 h-16 rounded-full bg-primary/10 flex items-center justify-center mb-4">
               <Lock className="w-8 h-8 text-primary" />
             </div>
-            <h2 className="text-2xl font-bold text-foreground">Unlock Full Report</h2>
+            <h2 className="text-2xl font-bold text-foreground">Get a personalized plan to outrank competitors</h2>
             <p className="text-sm text-muted-foreground mt-2">
-              Enter your details to reveal your competitors, keyword opportunities, and custom SEO insights.
+              Enter your details to see precisely how many customers you're losing and the exact steps to win them back.
             </p>
           </div>
 
@@ -104,7 +104,7 @@ export function LeadGateModal({ reportId, onUnlock }: { reportId: string, onUnlo
               disabled={loading}
             >
               {loading ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
-              Reveal My Results
+              Get My Growth Plan
             </Button>
             <p className="text-xs text-center text-muted-foreground mt-4">
               Your information is secure. We won't spam you.
