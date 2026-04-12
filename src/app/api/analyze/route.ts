@@ -109,6 +109,7 @@ export async function POST(req: Request) {
     let allQueriesOrganicResults: any[][] = [];
     let ranking = 0;
     let foundInLocalPack = false;
+    let trueSearchVol = 0;
 
     // ── PROGRESSIVE MULTI-QUERY EXTRACTION ──
     if (serpApiKey) {
@@ -118,6 +119,7 @@ export async function POST(req: Request) {
       organicResults = baseData.organicResults;
       localResults = baseData.localResults;
       allQueriesOrganicResults.push(baseData.organicResults);
+      trueSearchVol = baseData.trueSearchVolume || 0;
       logs.serpMs = ms1;
 
       if (businessName || website) {
@@ -161,16 +163,31 @@ export async function POST(req: Request) {
     // ── FEATURE ENGINEERING ──
     const searchFeatures = extractFeatures(ranking, foundInLocalPack, organicResults, keyword);
 
+    let competitors = extractCompetitors(organicResults, keyword);
+
+    // Compute strong competitors from organic results & average strength from competitors extraction
+    let strongCompetitorCount = 0;
+    const top10 = organicResults.slice(0, 10);
+    const directoryCountInTop10 = countDirectoriesInTopN(organicResults, 10);
+    
+    // Naively checking non-directories in top 10 as strong competitors
+    for (const r of top10) {
+       const isDir = r.link ? r.link.includes('yelp') || r.link.includes('justdial') : true; // Fallback or strict proxy
+       if (!isDir) strongCompetitorCount++;
+    }
+
+    const avgCompetitorStrength = competitors.length > 0 
+      ? competitors.reduce((acc, current) => acc + current.competitorScore, 0) / competitors.length / 100 
+      : 0.5;
+
     // ── SCORING ──
     const seoScore = calculateSeoScore({
       ranking,
       foundInLocalPack,
-      organicResultsCount: organicResults.length,
-      totalSearchResults: 1000,
-      directoryCountInTop10: countDirectoriesInTopN(organicResults, 10),
+      strongCompetitorCount,
+      directoryRatio: directoryCountInTop10 / 10,
+      avgCompetitorStrength
     });
-
-    let competitors = extractCompetitors(organicResults, keyword);
     
     // FEATURE 1 & 5: Dominance Score and Market Share
     const domRes = enrichCompetitorsWithDominance(competitors, allQueriesOrganicResults, localResults);
@@ -228,7 +245,7 @@ export async function POST(req: Request) {
 
     // FEATURE 3 & 4 resolution
     const seoAudit = await auditPromise;
-    const lossEstimateData = calculateCustomerLoss(ranking);
+    const lossEstimateData = calculateCustomerLoss(ranking, keyword, trueSearchVol);
 
     // ── DATABASE PERSISTENCE ──
     const report = new Report({
@@ -238,7 +255,10 @@ export async function POST(req: Request) {
       reviewMetrics,
       seoAudit,
       dominanceData,
-      lossEstimate: lossEstimateData.lossPercent
+      lossEstimate: {
+        lossPercent: lossEstimateData.lossPercent,
+        estimatedLostCustomers: lossEstimateData.estimatedLostCustomers
+      }
     });
     await report.save();
 

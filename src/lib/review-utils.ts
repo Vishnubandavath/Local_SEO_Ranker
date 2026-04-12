@@ -14,18 +14,23 @@ export interface ReviewMetrics {
 function tokenSimilarity(a: string, b: string): number {
   const normalize = (s: string) =>
     s.toLowerCase().replace(/['`]/g, '').replace(/[^a-z0-9\s]/g, ' ').trim();
-  const tokensA = new Set(normalize(a).split(/\s+/).filter(Boolean));
-  const tokensB = new Set(normalize(b).split(/\s+/).filter(Boolean));
+    
+  const normA = normalize(a);
+  const normB = normalize(b);
 
-  if (tokensA.size === 0 || tokensB.size === 0) return 0;
+  if (!normA || !normB) return 0;
+  
+  if (normA === normB || normB.includes(normA) || normA.includes(normB)) return 1.0;
 
-  let intersection = 0;
+  const tokensA = normA.split(/\s+/).filter(Boolean);
+  const tokensB = new Set(normB.split(/\s+/).filter(Boolean));
+
+  let matchCount = 0;
   for (const token of tokensA) {
-    if (tokensB.has(token)) intersection++;
+    if (tokensB.has(token)) matchCount++;
   }
 
-  const union = new Set([...tokensA, ...tokensB]).size;
-  return union > 0 ? intersection / union : 0;
+  return tokensA.length > 0 ? matchCount / tokensA.length : 0;
 }
 
 export function extractReviewMetrics(
@@ -84,7 +89,7 @@ export function extractReviewMetrics(
       compTotalReviews += reviews;
       compCount++;
       
-      const repScore = rating * Math.log(1 + reviews);
+      const repScore = Math.pow(rating, 2) * Math.log(1 + reviews);
       if (repScore > bestRepScore) {
         bestRepScore = repScore;
         result.topCompetitorName = r.title || 'Competitor';
@@ -98,7 +103,11 @@ export function extractReviewMetrics(
     result.competitorAvgRating = Number((compTotalRating / compCount).toFixed(1));
     result.competitorAvgReviews = Math.round(compTotalReviews / compCount);
     
-    result.messages.push(`You have ${result.userReviews} reviews vs competitor avg ${result.competitorAvgReviews}.`);
+    if (userResultIndex >= 0) {
+      result.messages.push(`You have ${result.userReviews} reviews vs competitor avg ${result.competitorAvgReviews}.`);
+    } else {
+      result.messages.push(`Your business is actively missing from the Map Pack (Top Competitors average ${result.competitorAvgReviews} reviews).`);
+    }
     
     if (result.topCompetitorName) {
       const topRating = result.topCompetitorRating.toFixed(1);

@@ -107,8 +107,10 @@ export default function ResultsPage({ params }: { params: Promise<{ id: string }
     return <div className="min-h-screen flex items-center justify-center">Report not found.</div>;
   }
 
-  const lossEstimate = reportData.lossEstimate ?? 8;
-  const lossClass = lossEstimate > 50 ? "text-red-500" : lossEstimate > 20 ? "text-yellow-500" : "text-green-500";
+  const lossEstimateObj = reportData.lossEstimate || { lossPercent: 8, estimatedLostCustomers: 0 };
+  const lossPercent = typeof lossEstimateObj === 'number' ? lossEstimateObj : lossEstimateObj.lossPercent ?? 8;
+  const lostVolume = typeof lossEstimateObj === 'object' ? lossEstimateObj.estimatedLostCustomers : 0;
+  const lossClass = lossPercent > 50 ? "text-red-500" : lossPercent > 20 ? "text-yellow-500" : "text-green-500";
   const compDensity = reportData.features?.competitorDensity ?? 0.5;
 
   return (
@@ -184,10 +186,11 @@ export default function ResultsPage({ params }: { params: Promise<{ id: string }
               <CardTitle className="text-xl text-red-400 font-bold uppercase tracking-wide">Customer Loss Estimate</CardTitle>
             </CardHeader>
             <CardContent className="flex-grow flex flex-col justify-center items-center text-center relative z-10 pb-10">
-              <span className={`text-7xl font-black tracking-tighter ${lossClass} drop-shadow-sm`}>{lossEstimate}%</span>
+              <span className={`text-7xl font-black tracking-tighter ${lossClass} drop-shadow-sm`}>{lossPercent}%</span>
               <div className="w-16 h-1 bg-red-500/30 my-4 rounded-full"></div>
               <span className="text-foreground text-lg font-medium leading-snug px-2">
-                You are losing ~<span className="text-red-400 font-bold">{lossEstimate}%</span> of potential customers to competitors based on your current visibility.
+                You are losing ~<span className="text-red-400 font-bold">{lossPercent}%</span> of potential customers.
+                {lostVolume > 0 && <span className="block mt-2 text-sm text-muted-foreground">Approx. <span className="text-red-400 font-bold">{lostVolume}</span> high-intent local searches missed per month.</span>}
               </span>
             </CardContent>
           </Card>

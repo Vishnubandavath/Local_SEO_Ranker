@@ -29,69 +29,44 @@ const SCORE_WEIGHTS = {
   difficulty: 0.15,
 } as const;
 
-interface SeoScoreInput {
-  /** Business ranking position in organic results (0 = not found) */
+export interface SeoScoreInput {
   ranking: number;
-  /** Whether the business appears in the Google Local Map Pack */
   foundInLocalPack: boolean;
-  /** Total number of organic results returned by the SERP */
-  organicResultsCount: number;
-  /** Total results reported by Google (search_information.total_results) */
-  totalSearchResults: number;
-  /** Number of directory/aggregator sites in the top 10 organic results */
-  directoryCountInTop10: number;
+  strongCompetitorCount: number;
+  directoryRatio: number;
+  avgCompetitorStrength: number;
 }
 
-/**
- * Calculates a normalized, weighted SEO score on a 0–100 scale.
- *
- * Uses exponential decay for ranking position and sigmoid-like curves
- * for competition depth — avoids the hard-bucket inflation problem
- * of the previous additive system.
- */
 export function calculateSeoScore(input: SeoScoreInput): number {
   const {
     ranking,
     foundInLocalPack,
-    organicResultsCount,
-    totalSearchResults,
-    directoryCountInTop10,
+    strongCompetitorCount,
+    directoryRatio,
+    avgCompetitorStrength
   } = input;
 
-  // ── Factor 1: Ranking Position (0–1, exponential decay) ──
-  // Position 1 → 1.0, position 10 → ~0.45, position 50 → ~0.04, not found → 0
-  let rankSignal = 0;
-  if (ranking > 0 && ranking <= 100) {
-    // Decay constant tuned so position 3 ≈ 0.85, position 10 ≈ 0.45
-    rankSignal = Math.exp(-0.08 * (ranking - 1));
+  // Task 2: Smoother Ranking Signal
+  let rankScore = 0;
+  if (ranking > 0) {
+    rankScore = 1 / (1 + 0.05 * (ranking - 1));
   }
-  // ranking === 0 means not found → rankSignal stays 0
 
-  // ── Factor 2: Map Pack Presence (binary: 0 or 1) ──
-  const mapPackSignal = foundInLocalPack ? 1.0 : 0.0;
+  // Task 3: Competition Signal (# strong competitors in top 10 / 10)
+  const competition = Math.min(strongCompetitorCount, 10) / 10;
 
-  // ── Factor 3: Competition Depth (0–1, inverse sigmoid) ──
-  // Fewer organic results = less competition = higher signal
-  // Sigmoid centered at 50 results, steepness 0.08
-  const competitionSignal = 1 / (1 + Math.exp(0.08 * (organicResultsCount - 50)));
+  // Task 4: Difficulty Signal (Directory Ratio + Avg Strength)
+  const difficulty = 0.5 * directoryRatio + 0.5 * avgCompetitorStrength;
 
-  // ── Factor 4: Keyword Difficulty Proxy (0–1) ──
-  // If top 10 is dominated by directories, the keyword is less competitive
-  // for real businesses → higher opportunity signal.
-  // If 0 directories in top 10, pure organic competition → harder → lower signal.
-  // Capped at 10 since we only look at top 10.
-  const dirRatio = Math.min(directoryCountInTop10, 10) / 10;
-  // Mix: more directories = easier to rank = higher signal
-  const difficultySignal = 0.3 + 0.7 * dirRatio;
+  const mapPresence = foundInLocalPack ? 1.0 : 0.0;
 
-  // ── Weighted Sum ──
+  // Task 5: Final Visibility Score
   const rawScore =
-    SCORE_WEIGHTS.ranking * rankSignal +
-    SCORE_WEIGHTS.mapPack * mapPackSignal +
-    SCORE_WEIGHTS.competition * competitionSignal +
-    SCORE_WEIGHTS.difficulty * difficultySignal;
+    0.45 * rankScore +
+    0.25 * mapPresence +
+    0.15 * (1 - competition) +
+    0.15 * (1 - difficulty);
 
-  // Scale to 0–100 and clamp
   return Math.round(Math.min(100, Math.max(0, rawScore * 100)));
 }
 
@@ -319,6 +294,7 @@ export interface CompetitorResult {
   dominanceScore?: number;
   marketShare?: number;
   frequency?: number;
+  category?: string;
 }
 
 // ── Competitor Scoring Weights ──
@@ -639,18 +615,32 @@ export function extractFeatures(
   };
 }
 
-export function calculateCustomerLoss(rank: number) {
+export function calculateCustomerLoss(rank: number, keyword: string, baseTraffic: number) {
   const ctrMap = [0.28, 0.15, 0.10, 0.07, 0.05, 0.04, 0.03, 0.02, 0.01, 0.01];
-  const potentialTraffic = 0.28;
-  const actualTraffic = (rank > 0 && rank <= 10) ? ctrMap[rank - 1] : 0;
+  const ctrRank1 = 0.28;
+  const ctrCurrent = (rank > 0 && rank <= 10) ? ctrMap[rank - 1] : 0;
   
-  const loss = potentialTraffic - actualTraffic;
-  const lossPercent = Math.round((loss / potentialTraffic) * 100);
+  const kwLower = keyword.toLowerCase();
+  let intentWeight = 0.7; // generic
+  if (/\b(near me|nearby)\b/.test(kwLower)) {
+    intentWeight = 1.2;
+  } else if (/\b(in |area|city)\b/.test(kwLower) || kwLower.split(' ').length > 2) {
+    intentWeight = 1.0;
+  }
+
+  const estimatedSearchVolume = baseTraffic > 0 ? baseTraffic : 1200;
+
+  const potentialTraffic = ctrRank1 * intentWeight * estimatedSearchVolume;
+  const actualTraffic = ctrCurrent * intentWeight * estimatedSearchVolume;
+  
+  const loss = Math.max(0, potentialTraffic - actualTraffic);
+  const lossPercent = Math.round((ctrRank1 - ctrCurrent) / ctrRank1 * 100);
   
   return {
     potentialTraffic,
     actualTraffic,
-    lossPercent: Math.max(0, lossPercent)
+    lossPercent: Math.max(0, lossPercent),
+    estimatedLostCustomers: Math.round(loss)
   };
 }
 
@@ -666,6 +656,15 @@ export function enrichCompetitorsWithDominance(
 ): { enriched: CompetitorResult[], dominance: DominanceData } {
   let totalDominance = 0;
 
+  // Pre-calculate maxRep once
+  let maxRep = 1;
+  for (const r of localResults) {
+    if (r.rating && r.reviews) {
+      const score = Math.pow(r.rating, 2) * Math.log(1 + r.reviews);
+      if (score > maxRep) maxRep = score;
+    }
+  }
+
   const enriched = competitors.map(comp => {
     const rankingScore = comp.position > 0 ? (1 / comp.position) * 100 : 0;
     
@@ -676,7 +675,8 @@ export function enrichCompetitorsWithDominance(
       (r.title && r.title.toLowerCase().includes(comp.title.toLowerCase()))
     );
     if (compLocal) {
-      reviewStrength = (compLocal.rating || 0) * Math.log(1 + (compLocal.reviews || 0));
+      const rawRep = Math.pow(compLocal.rating || 0, 2) * Math.log(1 + (compLocal.reviews || 0));
+      reviewStrength = Math.min(100, (rawRep / maxRep) * 100);
     }
 
     const keywordMatch = comp.competitorScore;
@@ -692,10 +692,10 @@ export function enrichCompetitorsWithDominance(
     const presenceAcrossQueries = allOrganicResults.length > 0 ? (frequency / allOrganicResults.length) * 100 : 100;
 
     const dominanceScore = Math.round(
-      0.3 * rankingScore + 
-      0.3 * reviewStrength + 
-      0.2 * keywordMatch + 
-      0.2 * presenceAcrossQueries
+      0.4 * rankingScore + 
+      0.25 * reviewStrength + 
+      0.2 * presenceAcrossQueries + 
+      0.15 * keywordMatch
     );
 
     totalDominance += dominanceScore;

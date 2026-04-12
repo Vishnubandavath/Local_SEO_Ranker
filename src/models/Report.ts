@@ -83,7 +83,7 @@ const ReportSchema: Schema = new Schema({
   reviewMetrics: { type: Schema.Types.Mixed },
   seoAudit: { type: Schema.Types.Mixed },
   dominanceData: { type: Schema.Types.Mixed },
-  lossEstimate: { type: Number }
+  lossEstimate: { type: Schema.Types.Mixed }
 });
 
 // Clear Mongoose model cache in Next.js Hot Module Reloads
